@@ -1,0 +1,13 @@
+{
+  "name": "love-buster-show",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Demo merchant site — pay-per-view streaming metered by SynthPay TrustLedger.",
+  "scripts": {
+    "deploy": "netlify deploy --build --prod",
+    "preview": "netlify deploy --build"
+  },
+  "dependencies": {
+    "@synthpay/trustledger-sdk": "file:packages/trustledger-sdk"
+  }
+}

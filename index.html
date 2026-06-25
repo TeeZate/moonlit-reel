@@ -39,7 +39,28 @@
 <script>
 const SITE = {
   title:   "Love Buster Show",
-  tagline: "Original dramas — free to watch",
+  tagline: "Original dramas — pay only for what you watch",
+};
+
+/*  ============================================================================
+    TRUSTLEDGER METERING  (pay-per-view via SynthPay)
+    ============================================================================
+    This site is a TrustLedger-metered merchant. Pressing play asks the
+    server-side gate (netlify/functions/watch.js) to charge the viewer's
+    SynthPay balance; only on success does the gate return the video URL.
+
+    Nothing secret lives here in the browser — the merchant API key, the viewer
+    id, and the real content URL all live in the Netlify Function + its env vars.
+    The frontend only knows each title's `movieId` and a price to display.
+
+    To go live: deploy with the env vars documented in netlify/functions/watch.js.
+    If `endpoint` is left blank (or enabled:false), the title plays free using
+    `src` — so the site never breaks while half-configured.
+    ============================================================================ */
+const TRUSTLEDGER = {
+  enabled:    true,
+  endpoint:   "/.netlify/functions/watch",          // the server-side gate
+  connectUrl: "https://account.synthpay.tech/connect", // one-time "Sign in with SynthPay" popup
 };
 
 const SERIES = [
@@ -49,8 +70,11 @@ const SERIES = [
     blurb: "A full-length drama about love, wealth, and the lengths one woman will go to change her fate.",
     episodes: [
       {
-        title: "Full Movie",
-        src:   "https://archive.org/download/poor-maid-marries-a-billionaire-at-all-costs-full-movie-love-buster-show-1080p/Poor_Maid_Marries_A_Billionaire_At_All_Costs___Full_Movie___@LoveBusterShow(1080p).mp4",
+        title:   "Full Movie",
+        movieId: "poor-maid-marries-a-billionaire",  // must match a key in watch.js CATALOG
+        price:   0.05,                               // display only; server charges the real endpoint price
+        // Free-play fallback if metering is disabled / not yet wired:
+        src:     "https://archive.org/download/poor-maid-marries-a-billionaire-at-all-costs-full-movie-love-buster-show-1080p/Poor_Maid_Marries_A_Billionaire_At_All_Costs___Full_Movie___@LoveBusterShow(1080p).mp4",
       },
     ],
   },
@@ -229,6 +253,50 @@ const SERIES = [
   @media (prefers-reduced-motion:reduce){
     *{animation:none !important; transition:none !important}
   }
+
+  /* ---- TrustLedger metering ---- */
+  .screen{position:relative}
+  .tl-dot{
+    display:inline-block; width:7px; height:7px; border-radius:50%;
+    background:var(--accent); box-shadow:0 0 8px 1px rgba(230,169,75,.6);
+    animation:pulse 1.6s ease-in-out infinite;
+  }
+  .balance-pill{
+    display:inline-flex; align-items:center; gap:7px;
+    font-size:12.5px; color:var(--muted);
+    border:1px solid var(--line-2); border-radius:999px; padding:4px 11px;
+  }
+  .balance-pill strong{color:var(--text); font-weight:700}
+  .gate{
+    position:absolute; inset:0; z-index:5;
+    display:grid; place-items:center; text-align:center;
+    background:radial-gradient(120% 120% at 50% 30%, rgba(30,24,48,.72), rgba(0,0,0,.88));
+    backdrop-filter:blur(3px);
+  }
+  .gate[hidden]{display:none}
+  .gate-card{padding:30px 28px; max-width:340px}
+  .gate-eyebrow{
+    display:inline-flex; align-items:center; gap:8px;
+    font-size:11.5px; font-weight:600; letter-spacing:.1em; text-transform:uppercase;
+    color:var(--accent); margin-bottom:16px;
+  }
+  .gate-title{font-family:"Fraunces",serif; font-weight:500; font-size:24px; line-height:1.2}
+  .gate-price{
+    font-family:"Fraunces",serif; font-size:40px; font-weight:600;
+    color:var(--accent); margin:6px 0 20px;
+  }
+  .gate-btn{
+    cursor:pointer; font:inherit; font-size:15px; font-weight:700;
+    color:var(--bg); background:var(--accent); border:1px solid var(--accent);
+    border-radius:11px; padding:12px 26px;
+    transition:filter .15s, transform .05s, opacity .15s;
+  }
+  .gate-btn:hover{filter:brightness(1.06)}
+  .gate-btn:active{transform:translateY(1px)}
+  .gate-btn:disabled{opacity:.55; cursor:wait}
+  .gate-msg{margin-top:16px; font-size:13.5px; color:var(--muted); min-height:18px; line-height:1.5}
+  .gate-msg a{color:var(--accent); font-weight:600}
+  .gate-msg.err{color:var(--rose)}
 </style>
 </head>
 <body>
@@ -240,6 +308,9 @@ const SERIES = [
     <div class="tag">
       <span class="pill">Now showing</span>
       <span id="siteTagline"></span>
+      <span class="balance-pill" id="balancePill" hidden>
+        <span class="tl-dot"></span> Balance <strong id="balanceVal">—</strong>
+      </span>
     </div>
   </header>
 
@@ -247,6 +318,15 @@ const SERIES = [
     <main>
       <div class="screen">
         <video id="player" controls playsinline preload="metadata"></video>
+        <div class="gate" id="gate" hidden>
+          <div class="gate-card">
+            <div class="gate-eyebrow"><span class="tl-dot"></span> Metered by TrustLedger</div>
+            <div class="gate-title" id="gateTitle">Pay to watch</div>
+            <div class="gate-price" id="gatePrice"></div>
+            <button class="gate-btn" id="gateBtn">Unlock &amp; play</button>
+            <div class="gate-msg" id="gateMsg"></div>
+          </div>
+        </div>
       </div>
 
       <div class="nowmeta" id="nowmeta">
@@ -415,9 +495,20 @@ const SERIES = [
       nowmeta.classList.remove('swap');
     }, 180);
 
-    player.src = ep.src;
     if (ep.poster) player.poster = ep.poster; else player.removeAttribute('poster');
-    if (autoplay) player.play().catch(() => {});
+
+    // TrustLedger gate: if this episode is metered and not yet paid for this
+    // session, hold the video behind the paywall instead of loading it.
+    if (TL.isMetered(ep) && !TL.isUnlocked(ep)) {
+      player.pause();
+      player.removeAttribute('src');
+      player.load();
+      TL.showGate(ep);
+    } else {
+      TL.hideGate();
+      player.src = ep.src;
+      if (autoplay) player.play().catch(() => {});
+    }
 
     document.getElementById('prevBtn').disabled = k === 0;
     document.getElementById('nextBtn').disabled = k === eps.length - 1;
@@ -488,6 +579,174 @@ const SERIES = [
         break;
     }
   });
+
+  // ============================================================================
+  // TrustLedger middleware — pay-per-view via SynthPay /users/pay
+  // ============================================================================
+  const TL = (() => {
+    const cfg   = TRUSTLEDGER;
+    const gate     = document.getElementById('gate');
+    const gateBtn  = document.getElementById('gateBtn');
+    const gateMsg  = document.getElementById('gateMsg');
+    const gatePrice= document.getElementById('gatePrice');
+    const gateTitle= document.getElementById('gateTitle');
+    const balPill  = document.getElementById('balancePill');
+    const balVal   = document.getElementById('balanceVal');
+    const unlocked = new Set();         // movieIds paid for this session
+    let   pending  = null;              // episode awaiting payment
+    const TOKEN_KEY = 'synthpay_viewer_token';
+
+    // An episode is metered when metering is on and it has a movieId the
+    // server-side gate knows about. The merchant key + content URL live there.
+    const isMetered = (ep) => !!(cfg.enabled && cfg.endpoint && ep && ep.movieId);
+    const isUnlocked = (ep) => !ep || !ep.movieId || unlocked.has(ep.movieId);
+
+    const fmt = (n) => '$' + Number(n).toFixed(Number(n) < 1 ? 4 : 2);
+    const getToken = () => localStorage.getItem(TOKEN_KEY);
+    const setToken = (t) => localStorage.setItem(TOKEN_KEY, t);
+    const clearToken = () => localStorage.removeItem(TOKEN_KEY);
+
+    function setBalance(n){
+      if (typeof n !== 'number') return;
+      balVal.textContent = fmt(n);
+      balPill.hidden = false;
+    }
+
+    function showGate(ep){
+      pending = ep;
+      gateTitle.textContent = 'Pay to watch';
+      gatePrice.textContent = fmt(ep.price);
+      gateMsg.textContent = '';
+      gateMsg.classList.remove('err');
+      gateBtn.disabled = false;
+      gateBtn.textContent = getToken() ? 'Unlock & play' : 'Sign in & play';
+      gate.hidden = false;
+    }
+    function hideGate(){ gate.hidden = true; pending = null; }
+
+    // Paid, but the browser blocked autoplay after the async step — offer a
+    // single play tap (a fresh gesture). Never re-charges.
+    function showPaidReady(){
+      gateTitle.textContent = 'Paid ✓';
+      gatePrice.textContent = '';
+      gateMsg.textContent = '';
+      gateMsg.classList.remove('err');
+      gateBtn.disabled = false;
+      gateBtn.textContent = '▶ Play';
+    }
+
+    // One-time "Sign in with SynthPay" — passkeys only work on SynthPay's own
+    // domain, so we authenticate in a popup and cache the returned token. Every
+    // later unlock skips this entirely.
+    function synthpayOrigin(){ try { return new URL(cfg.connectUrl).origin; } catch { return '*'; } }
+    function connect(){
+      return new Promise((resolve, reject) => {
+        const origin = synthpayOrigin();
+        const w = window.open(
+          cfg.connectUrl + '?origin=' + encodeURIComponent(location.origin),
+          'synthpay_connect', 'width=420,height=640'
+        );
+        if (!w) { reject(new Error('popup_blocked')); return; }
+        let done = false;
+        function onMsg(e){
+          if (origin !== '*' && e.origin !== origin) return;
+          if (!e.data || e.data.type !== 'synthpay-connected') return;
+          done = true;
+          window.removeEventListener('message', onMsg);
+          setToken(e.data.token);
+          setBalance(e.data.balance);
+          resolve(e.data.token);
+        }
+        window.addEventListener('message', onMsg);
+        const iv = setInterval(() => {
+          if (w.closed) { clearInterval(iv); if (!done){ window.removeEventListener('message', onMsg); reject(new Error('cancelled')); } }
+        }, 400);
+      });
+    }
+
+    async function charge(ep, token){
+      const r = await fetch(cfg.endpoint, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ movieId: ep.movieId, viewerToken: token }),
+      });
+      const data = await r.json().catch(() => ({}));
+      return { ok: r.ok, status: r.status, data };
+    }
+
+    async function pay(){
+      const ep = pending;
+      if (!ep) return;
+      gateBtn.disabled = true;
+      gateMsg.classList.remove('err');
+      gateMsg.textContent = '';
+      try {
+        let token = getToken();
+        if (!token) { gateBtn.textContent = 'Connecting…'; token = await connect(); }
+
+        gateBtn.textContent = 'Charging…';
+        let res = await charge(ep, token);
+
+        // Token expired → reconnect once, then retry.
+        if (res.status === 401) {
+          clearToken();
+          gateBtn.textContent = 'Connecting…';
+          token = await connect();
+          gateBtn.textContent = 'Charging…';
+          res = await charge(ep, token);
+        }
+
+        const data = res.data;
+        if (res.ok && data.url) {
+          unlocked.add(ep.movieId);
+          ep._url = data.url;
+          setBalance(data.balance_after);
+          player.src = data.url;
+          try {
+            await player.play();   // same flow → movie just plays
+            hideGate();
+          } catch (_) {
+            showPaidReady();       // autoplay blocked → one tap to play, no re-charge
+          }
+          return;
+        }
+
+        if (res.status === 402) {
+          gateMsg.innerHTML = 'Not enough balance. <a href="https://account.synthpay.tech" target="_blank" rel="noopener">Top up your account →</a>';
+        } else if (res.status === 429) {
+          gateMsg.textContent = data.error || 'Daily spend limit reached.';
+        } else if (res.status === 401) {
+          gateMsg.textContent = 'Sign in with SynthPay to watch.';
+        } else {
+          gateMsg.textContent = data.error || 'Payment failed — please try again.';
+        }
+        gateMsg.classList.add('err');
+      } catch (e) {
+        if (e && e.message === 'popup_blocked') gateMsg.textContent = 'Allow popups to sign in with SynthPay.';
+        else if (e && e.message === 'cancelled') gateMsg.textContent = 'Sign-in cancelled.';
+        else gateMsg.textContent = 'Could not reach the payment service.';
+        gateMsg.classList.add('err');
+      } finally {
+        gateBtn.disabled = false;
+        gateBtn.textContent = 'Unlock & play';
+      }
+    }
+
+    // Already paid this session → the click is just a play gesture (no charge).
+    async function onGateClick(){
+      const ep = pending;
+      if (!ep) return;
+      if (isUnlocked(ep)) {
+        if (ep._url) player.src = ep._url;
+        try { await player.play(); hideGate(); } catch (_) {}
+        return;
+      }
+      await pay();
+    }
+
+    gateBtn.addEventListener('click', onGateClick);
+    return { isMetered, isUnlocked, showGate, hideGate };
+  })();
 
   // ---- boot ----
   renderList();

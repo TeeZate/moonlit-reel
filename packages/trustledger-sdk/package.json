@@ -1,0 +1,12 @@
+{
+  "name": "@synthpay/trustledger-sdk",
+  "version": "1.0.0",
+  "description": "Merchant SDK for SynthPay TrustLedger — charge a viewer per request from your server, with pay-per-use gating.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "type": "commonjs",
+  "files": ["index.js", "index.d.ts", "README.md"],
+  "engines": { "node": ">=18" },
+  "keywords": ["synthpay", "trustledger", "pay-per-use", "micropayments", "api-billing"],
+  "license": "MIT"
+}
